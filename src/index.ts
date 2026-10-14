@@ -134,19 +134,17 @@ export default {
    * Cron trigger — runs daily at 3am UTC.
    * Re-scrapes the maree.info harbour list and syncs any additions or name
    * changes to D1. Tide data itself is cached per-harbour in KV on demand.
+   * Errors propagate so failed runs show up as failures in the dashboard.
    */
   async scheduled(
     _event: ScheduledEvent,
     env: CloudflareEnv,
     _ctx: ExecutionContext
   ): Promise<void> {
-    console.log("Cron: syncing harbour registry...");
-    try {
-      const harbourData = await fetchHarboursData();
-      await updateHarbourDatabase(harbourData, env);
-      console.log("Cron: harbour registry synced.");
-    } catch (err) {
-      console.error("Cron: sync failed:", err);
-    }
+    const { upserted, deleted } = await updateHarbourDatabase(
+      await fetchHarboursData(),
+      env
+    );
+    console.log(`Cron: harbour registry synced (${upserted} upserted, ${deleted} deleted).`);
   },
 };

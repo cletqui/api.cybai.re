@@ -58,31 +58,44 @@ export async function getHarbourByName(
   }
 }
 
+export interface HarbourSyncResult {
+  upserted: number;
+  deleted: number;
+}
+
+const BATCH_SIZE = 50;
+
 /**
  * Syncs the D1 table with a fresh { id: name } map from maree.info.
- * Inserts new harbours and updates any whose name changed.
+ * Upserts new or renamed harbours and deletes ones no longer listed.
+ * Refuses to run on an empty map so a scraping failure can't wipe the registry.
  */
 export async function updateHarbourDatabase(
   harbourData: HarbourDatabase,
   env: CloudflareEnv
-): Promise<void> {
+): Promise<HarbourSyncResult> {
+  if (Object.keys(harbourData).length === 0) {
+    throw new Error("Refusing to sync an empty harbour list.");
+  }
+
   const existing = await getHarbourDatabase(env);
 
-  const writes = Object.entries(harbourData)
+  const upserts = Object.entries(harbourData)
     .filter(([id, name]) => existing[id] !== name)
-    .map(([id, name]) => insertHarbour(id, name, env));
+    .map(([id, name]) =>
+      env.DB.prepare(
+        `INSERT INTO harbour_table (id, name) VALUES (?, ?)
+         ON CONFLICT(id) DO UPDATE SET name = excluded.name`
+      ).bind(id, name)
+    );
+  const deletes = Object.keys(existing)
+    .filter((id) => !(id in harbourData))
+    .map((id) => env.DB.prepare(`DELETE FROM harbour_table WHERE id = ?`).bind(id));
 
-  await Promise.all(writes);
-}
+  const statements = [...upserts, ...deletes];
+  for (let i = 0; i < statements.length; i += BATCH_SIZE) {
+    await env.DB.batch(statements.slice(i, i + BATCH_SIZE));
+  }
 
-// ── Internal ───────────────────────────────────────────────────────────────
-
-async function insertHarbour(
-  id: string,
-  name: string,
-  env: CloudflareEnv
-): Promise<D1Result> {
-  return env.DB.prepare(`INSERT OR REPLACE INTO harbour_table (id, name) VALUES (?, ?)`)
-    .bind(id, name)
-    .run();
+  return { upserted: upserts.length, deleted: deletes.length };
 }

@@ -44,10 +44,7 @@ export async function getTideData(
   const harbour = await getHarbourFromRequest(req, env);
 
   if (!harbour || !("harbour" in harbour)) {
-    const error = Object.assign(
-      new Error("Harbour doesn't exist on maree.info."),
-      { status: 404 }
-    );
+    const error = Object.assign(new Error("Harbour doesn't exist on maree.info."), { status: 404 });
     throw error;
   }
 
@@ -74,7 +71,7 @@ async function getRawTideData(
 
   if (env.TIDE_KV) {
     const cached = await env.TIDE_KV.get<RawTideData>(key, "json");
-    if (cached) return { rawData: cached, fromCache: true };
+    if (cached && !isStale(cached)) return { rawData: cached, fromCache: true };
   }
 
   const rawData = await fetchTideData(id);
@@ -86,6 +83,20 @@ async function getRawTideData(
   }
 
   return { rawData, fromCache: false };
+}
+
+/**
+ * Cached data is stale once its first day is no longer today in Paris, e.g.
+ * data scraped at 23:00 and read after midnight.
+ */
+function isStale(data: RawTideData): boolean {
+  const today = new Date()
+    .toLocaleDateString("sv", { timeZone: "Europe/Paris" })
+    .replaceAll("-", "");
+  const firstDay = Object.keys(data)
+    .sort()[0]
+    ?.slice(0, 8);
+  return firstDay === undefined || firstDay < today;
 }
 
 /**

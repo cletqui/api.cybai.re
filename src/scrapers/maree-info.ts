@@ -28,10 +28,14 @@ export async function fetchHarboursData(): Promise<HarbourDatabase> {
   try {
     const html = await fetchPage(BASE_URL);
     const content = extractElementHtml(html, "PortsListe_Content_0");
-    return parseHarbourList(content);
+    const harbours = parseHarbourList(content);
+    if (Object.keys(harbours).length === 0) {
+      throw new Error("Harbour list on maree.info is empty.");
+    }
+    return harbours;
   } catch (error) {
     console.error("Error fetching harbour list:", error);
-    (error as any).status = 404;
+    (error as any).status = 502;
     throw error;
   }
 }
@@ -44,10 +48,14 @@ export async function fetchTideData(harbourId: string): Promise<RawTideData> {
   try {
     const html = await fetchPage(`${BASE_URL}${harbourId}`);
     const content = extractElementHtml(html, "MareeJours_Content");
-    return parseTideTable(content);
+    const data = parseTideTable(content);
+    if (Object.keys(data).length === 0) {
+      throw new Error(`No tide data found on maree.info for harbour ${harbourId}.`);
+    }
+    return data;
   } catch (error) {
     console.error(`Error fetching tide data for harbour ${harbourId}:`, error);
-    (error as any).status = 404;
+    (error as any).status = 502;
     throw error;
   }
 }
@@ -65,7 +73,7 @@ export async function fetchNearestHarbours(
     return parseHarbourSearchResults(innerHtml);
   } catch (error) {
     console.error("Error fetching nearest harbours:", error);
-    (error as any).status = 404;
+    (error as any).status = 502;
     throw error;
   }
 }
@@ -74,13 +82,15 @@ export async function fetchNearestHarbours(
  * Processes raw tide data into a summary object.
  * Always computed fresh — never cached — so last_tide and next_tide are accurate.
  */
-export function extractExtraData(tideData: RawTideData): TideExtraData {
+export function extractExtraData(
+  tideData: RawTideData,
+  now: Date = new Date()
+): TideExtraData {
   let forecast: Partial<DayForecastWithIndex> = {};
   let lastTide: TideEntry | null = null;
   let nextTide: TideEntry | null = null;
   let nowFound = false;
 
-  const now = new Date();
   // Tide times from maree.info are in Europe/Paris local time. We store them
   // with a Z suffix so the UTC numeric value equals the Paris clock value.
   // Mirror that trick for `now` so both sides are directly comparable.
@@ -103,15 +113,15 @@ export function extractExtraData(tideData: RawTideData): TideExtraData {
     for (const tide of value.tide_data) {
       const dateString = `${year}-${month}-${day}T${tide.time.replace("h", ":")}:00.000Z`;
       const date = new Date(dateString);
-      date.setDate(date.getDate() + dayOffset);
+      date.setUTCDate(date.getUTCDate() + dayOffset);
 
-      // Format as "DD/MM/YYYY HH:MM:SS" using UTC values — the naive-UTC trick
-      // stores Paris local time in the UTC slots, so we must always read UTC.
-      // toLocaleString() is intentionally avoided: its output depends on the
-      // runtime locale/timezone and varies across environments.
+      // Read UTC fields: the naive-UTC trick stores Paris local time there, and
+      // toLocaleString() output varies with the runtime locale.
       const p = (n: number) => String(n).padStart(2, "0");
       tide.timestamp = `${p(date.getUTCDate())}/${p(date.getUTCMonth() + 1)}/${date.getUTCFullYear()} ${p(date.getUTCHours())}:${p(date.getUTCMinutes())}:${p(date.getUTCSeconds())}`;
 
+      // TODO: the first tide of the day has no visibility into the previous
+      // day's last tide. Handled in services/tide.ts via KV fallback.
       if (!nowFound) {
         if (date > nowParisNaive) {
           nextTide = tide;
@@ -130,6 +140,9 @@ export function extractExtraData(tideData: RawTideData): TideExtraData {
 
 async function fetchPage(url: string): Promise<string> {
   const response = await fetch(url, HTML_OPTIONS);
+  if (!response.ok) {
+    throw new Error(`maree.info responded ${response.status} for ${url}`);
+  }
   return response.text();
 }
 
@@ -153,7 +166,7 @@ async function fetchNearestHarboursJs(name: string): Promise<string> {
 
 // ── Parsing ────────────────────────────────────────────────────────────────
 
-function extractElementHtml(html: string, elementId: string): string {
+export function extractElementHtml(html: string, elementId: string): string {
   const $ = load(html);
   const el = $(`#${elementId}`);
   if (el.length === 0) {
@@ -163,7 +176,7 @@ function extractElementHtml(html: string, elementId: string): string {
   return el.html() ?? "";
 }
 
-function parseHarbourList(html: string): HarbourDatabase {
+export function parseHarbourList(html: string): HarbourDatabase {
   const $ = load(html);
   const result: HarbourDatabase = {};
   $("a").each((_, el) => {
@@ -174,7 +187,7 @@ function parseHarbourList(html: string): HarbourDatabase {
   return result;
 }
 
-function parseTideTable(html: string): RawTideData {
+export function parseTideTable(html: string): RawTideData {
   const $ = load(html);
   const result: RawTideData = {};
 
@@ -182,40 +195,39 @@ function parseTideTable(html: string): RawTideData {
     const row = $(element);
     const dateLink = row.find("th a");
 
-    const onmouseover = dateLink.attr("onmouseover") ?? "";
-    const match = onmouseover.match(/\?d=(\d+)/);
+    const match = (dateLink.attr("onmouseover") ?? "").match(/\?d=(\d{8})(\d)/);
     if (!match) return;
-    const dateKey = match[1];
+    const [, baseDate, offset] = match;
+    const dateKey = baseDate + offset;
 
+    // Each <td> is a column (times, heights, coefficients) whose values are
+    // separated by <br>; empty slots are &nbsp;.
+    const columns = row
+      .find("td")
+      .toArray()
+      .map((td) =>
+        ($(td).html() ?? "")
+          .split(/<br\s*\/?>/i)
+          .map((cell) => load(`<i>${cell}</i>`)("i").text().replace(/\u00a0/g, " ").trim())
+      );
+    const [times = [], heights = [], coeffs = []] = columns.map(splitColumn);
+
+    const actual = new Date(
+      Date.UTC(
+        parseInt(baseDate.slice(0, 4), 10),
+        parseInt(baseDate.slice(4, 6), 10) - 1,
+        parseInt(baseDate.slice(6, 8), 10) + parseInt(offset, 10)
+      )
+    );
+    const monthName = new Intl.DateTimeFormat("fr", {
+      month: "long",
+      timeZone: "UTC",
+    }).format(actual);
     const dateNum = dateLink.find("b").text();
     const dayName = dateLink.text().replace(dateNum, "").trim();
-    const year = dateKey.slice(0, 4);
-    const monthNum = parseInt(dateKey.slice(4, 6), 10) - 1;
-    const monthName = Intl.DateTimeFormat("fr", { month: "long" }).format(
-      new Date(parseInt(year, 10), monthNum, 1)
-    );
-
-    // The cell text combines times (00h00), heights (0,00m) and coefficients
-    const cellText = row
-      .find("td")
-      .text()
-      .split("\n")
-      .map((s) => s.trim())
-      .join("");
-
-    const timeIndex = cellText.lastIndexOf("h") + 3;
-    const highIndex = cellText.lastIndexOf("m") + 1;
-
-    const times = cellText.slice(0, timeIndex).match(/.{1,5}/g) ?? [];
-    const heights = cellText.slice(timeIndex, highIndex).match(/[\d.,]+m/g) ?? [];
-    const coeffs = cellText
-      .slice(highIndex)
-      .split(/\s+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
 
     result[dateKey] = {
-      date: `${dayName} ${dateNum} ${monthName} ${year}`,
+      date: `${dayName} ${dateNum} ${monthName} ${actual.getUTCFullYear()}`,
       tide_data: buildTideArray(times, heights, coeffs),
     };
   });
@@ -223,7 +235,11 @@ function parseTideTable(html: string): RawTideData {
   return result;
 }
 
-function buildTideArray(
+function splitColumn(cells: string[]): string[] {
+  return cells.filter((c) => c !== "");
+}
+
+export function buildTideArray(
   times: string[],
   heights: string[],
   coeffs: string[]
@@ -231,18 +247,15 @@ function buildTideArray(
   const firstType = inferFirstTideType(heights);
   const secondType: TideType = firstType === "high_tide" ? "low_tide" : "high_tide";
 
-  let highCount = 0;
+  // maree.info lists one coefficient per high tide, in order.
+  let coeffIndex = 0;
   return times.map((time, i) => {
-    const type: TideType = i % 2 === 0 ? firstType : secondType;
+    const type = i % 2 === 0 ? firstType : secondType;
     const entry: TideEntry = { type, time, high: heights[i] };
-    // Assign coeff to high tides only, regardless of index parity.
-    // Days starting with a low tide would otherwise put coeffs on low tides.
-    if (type === "high_tide") {
-      const coeff = coeffs[highCount++];
-      if (coeff !== undefined) {
-        entry.coeff = coeff;
-        entry.coeff_label = coefficientLabel(coeff);
-      }
+    if (type === "high_tide" && coeffs[coeffIndex] !== undefined) {
+      const coeff = coeffs[coeffIndex++];
+      entry.coeff = coeff;
+      entry.coeff_label = coefficientLabel(coeff);
     }
     return entry;
   });
@@ -257,7 +270,7 @@ function buildTideArray(
  *   ≤ 95  → vive-eau (spring tide)
  *   > 95  → vive-eau exceptionnelle
  */
-function coefficientLabel(coeff: string): CoeffLabel | null {
+export function coefficientLabel(coeff: string): CoeffLabel | null {
   const n = parseInt(coeff, 10);
   if (isNaN(n)) return null;
   if (n <= 45) return "morte-eau";
@@ -266,7 +279,7 @@ function coefficientLabel(coeff: string): CoeffLabel | null {
   return "vive-eau exceptionnelle";
 }
 
-function inferFirstTideType(heights: string[]): TideType {
+export function inferFirstTideType(heights: string[]): TideType {
   try {
     const first = parseFloat(heights[0].replace(",", "."));
     const second = parseFloat(heights[1].replace(",", "."));
@@ -278,11 +291,12 @@ function inferFirstTideType(heights: string[]): TideType {
 
 // maree.info returns a JS snippet that sets e.innerHTML; we parse the AST to
 // extract the HTML string rather than relying on fragile regex.
-function extractInnerHtmlFromJs(jsString: string): string {
+export function extractInnerHtmlFromJs(jsString: string): string {
   try {
     const ast = parse(jsString, { ecmaVersion: "latest" });
     let value: string | undefined;
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     function traverse(node: any): void {
       if (!node || typeof node !== "object") return;
       if (
@@ -307,7 +321,7 @@ function extractInnerHtmlFromJs(jsString: string): string {
   }
 }
 
-function parseHarbourSearchResults(html: string): NearestHarboursRaw {
+export function parseHarbourSearchResults(html: string): NearestHarboursRaw {
   const $ = load(html);
 
   const pick = (selector: string): Array<{ id: number }> =>
